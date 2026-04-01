@@ -134,7 +134,7 @@ def main():
                 lcd.show("Rejected!", reason_short)
                 beep(3)
                 print(f"[MAIN] Rejected: {result.reason}")
-                time.sleep(4)
+                time.sleep(2)
  
         except Exception as e:
             print(f"[MAIN] Unexpected error: {e}")
