@@ -25,7 +25,8 @@ from modules.cloud_sync import start_background_sync
  
  
 # -- GPIO setup ----------------------------------------------------------------
- 
+ #hello this is the nw comments
+
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(BUZZER_PIN, GPIO.OUT, initial=GPIO.LOW)
  
@@ -133,7 +134,7 @@ def main():
                 lcd.show("Rejected!", reason_short)
                 beep(3)
                 print(f"[MAIN] Rejected: {result.reason}")
-                time.sleep(2)
+                time.sleep(4)
  
         except Exception as e:
             print(f"[MAIN] Unexpected error: {e}")
