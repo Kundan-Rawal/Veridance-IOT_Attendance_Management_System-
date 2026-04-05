@@ -23,6 +23,7 @@ from config import (
     FACE_TIMEOUT_SECONDS,
     LIVENESS_LAPLACIAN_THRESHOLD,
     LIVENESS_MOTION_THRESHOLD,
+    HAAR_FACE, HAAR_EYE,
 )
 from modules.lcd_controller import lcd
 
@@ -50,12 +51,17 @@ def load_model():
 
 # ── Cascades ──────────────────────────────────────────────────────────────────
 
-_face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+from config import (
+    MODEL_PATH, LABELS_PATH,
+    CONFIDENCE_THRESHOLD,
+    FACE_TIMEOUT_SECONDS,
+    LIVENESS_LAPLACIAN_THRESHOLD,
+    LIVENESS_MOTION_THRESHOLD,
+    HAAR_FACE, HAAR_EYE,
 )
-_eye_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_eye.xml"
-)
+
+_face_cascade = cv2.CascadeClassifier(HAAR_FACE)
+_eye_cascade  = cv2.CascadeClassifier(HAAR_EYE)
 
 _BLINK_AVAILABLE = not _eye_cascade.empty()
 if not _BLINK_AVAILABLE:
@@ -73,52 +79,53 @@ class VerifyResult:
 
 
 # ── Simple blink state machine ────────────────────────────────────────────────
-
 class BlinkDetector:
     """
-    States:  WAITING_OPEN -> WAITING_CLOSE -> WAITING_REOPEN -> DONE
-    Each state needs CONFIRM_FRAMES consecutive matching readings to advance.
+    Blink detection using eye-region brightness drop.
+    When eyes close, the eye ROI gets significantly darker.
+    More reliable than cascade on Pi camera.
     """
-    CONFIRM_FRAMES = 2
-
     def __init__(self):
-        self._state   = "WAITING_OPEN"
-        self._counter = 0
-        self.done     = False
+        self.done          = False
+        self._brightness   = []   # rolling brightness history
+        self._phase        = "OPEN"   # OPEN -> DARK -> OPEN -> DONE
 
-    def update(self, eyes_open: bool) -> bool:
-        """Feed one frame reading. Returns True once a full blink is confirmed."""
+    def update_with_roi(self, face_roi_gray: np.ndarray) -> bool:
         if self.done:
             return True
 
-        if self._state == "WAITING_OPEN":
-            if eyes_open:
-                self._counter += 1
-                if self._counter >= self.CONFIRM_FRAMES:
-                    self._state   = "WAITING_CLOSE"
-                    self._counter = 0
-                    print("[BLINK] Phase 1/3: eyes open confirmed")
-            else:
-                self._counter = 0
+        h, w   = face_roi_gray.shape
+        # Eye zone = middle vertical third of face
+        eye_y1 = h // 4
+        eye_y2 = h // 2
+        eye_roi = face_roi_gray[eye_y1:eye_y2, w//6 : w - w//6]
 
-        elif self._state == "WAITING_CLOSE":
-            if not eyes_open:
-                self._counter += 1
-                if self._counter >= self.CONFIRM_FRAMES:
-                    self._state   = "WAITING_REOPEN"
-                    self._counter = 0
-                    print("[BLINK] Phase 2/3: eyes closed confirmed")
-            else:
-                self._counter = 0
+        brightness = float(np.mean(eye_roi))
+        self._brightness.append(brightness)
 
-        elif self._state == "WAITING_REOPEN":
-            if eyes_open:
-                self._counter += 1
-                if self._counter >= self.CONFIRM_FRAMES:
-                    self.done = True
-                    print("[BLINK] Phase 3/3: blink complete!")
-            else:
-                self._counter = 0
+        if len(self._brightness) > 20:
+            self._brightness.pop(0)
+
+        if len(self._brightness) < 6:
+            return False
+
+        baseline = max(self._brightness)
+        current  = self._brightness[-1]
+        drop     = baseline - current
+
+        print(f"[BLINK] phase={self._phase} brightness={current:.1f} "
+              f"baseline={baseline:.1f} drop={drop:.1f}")
+
+        if self._phase == "OPEN":
+            if drop > 15:          # eyes closing � brightness dropped
+                self._phase = "DARK"
+                print("[BLINK] Phase 1/2: eye closure detected")
+
+        elif self._phase == "DARK":
+            if drop < 5:           # eyes reopened � brightness recovered
+                self._phase = "DONE"
+                self.done   = True
+                print("[BLINK] Phase 2/2: blink complete!")
 
         return self.done
 

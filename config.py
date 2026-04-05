@@ -45,6 +45,8 @@ MODEL_PATH       = DATA_DIR / "models" / "face_model.yml"
 LABELS_PATH      = DATA_DIR / "models" / "labels.csv"
 LOG_DIR          = DATA_DIR / "logs"
 PENDING_SYNC_DIR = DATA_DIR / "pending_sync"
+HAAR_FACE = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+HAAR_EYE  = "/usr/share/opencv4/haarcascades/haarcascade_eye.xml"
  
 # Create dirs if they don't exist yet
 for _d in [DATA_DIR, MODEL_PATH.parent, LOG_DIR, PENDING_SYNC_DIR]:

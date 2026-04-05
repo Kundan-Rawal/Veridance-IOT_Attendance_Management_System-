@@ -25,15 +25,14 @@ import numpy as np
 
 os.chdir(Path(__file__).parent)
 
-from config import MODEL_PATH, LABELS_PATH, DATA_DIR
+from config import MODEL_PATH, LABELS_PATH, DATA_DIR, HAAR_FACE
 from modules.lcd_controller import lcd
 
 FACES_DIR    = DATA_DIR / "faces"
 SAMPLE_COUNT = 30
 
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+from config import MODEL_PATH, LABELS_PATH, DATA_DIR, HAAR_FACE
+face_cascade = cv2.CascadeClassifier(HAAR_FACE)
 
 
 # ── Label helpers ─────────────────────────────────────────────────────────────
