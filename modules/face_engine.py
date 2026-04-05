@@ -91,13 +91,16 @@ def verify_face(picam2, target_roll_no: str, recognizer, label_map: dict) -> Ver
     print(f"[FACE] Verifying roll: {target_roll_no}")
     print(f"[FACE] Timeout: {FACE_TIMEOUT_SECONDS}s  Threshold: {CONFIDENCE_THRESHOLD}")
 
-    deadline       = time.time() + FACE_TIMEOUT_SECONDS
-    prev_face_gray = None
-    identity_ok    = False
-    laplacian_ok   = False
-    motion_ok      = False
-    blink_det      = BlinkDetector()
-    blink_ok       = False
+    deadline        = time.time() + FACE_TIMEOUT_SECONDS
+    prev_face_gray  = None
+
+    # Track which checks have passed
+    identity_ok  = False
+    laplacian_ok = False
+    motion_ok    = False
+    blink_det    = BlinkDetector()
+    blink_ok     = False           # always run blink check
+
     frames_checked = 0
 
     while time.time() < deadline:
@@ -142,10 +145,16 @@ def verify_face(picam2, target_roll_no: str, recognizer, label_map: dict) -> Ver
             print(f"[MOTION] score={motion:.2f} ok={motion_ok}")
         prev_face_gray = roi_raw.copy()
 
-        # Layer 3: Blink
+        # ── Layer 3: Blink detection ──────────────────────────────────────
+        # -- Layer 3: Blink detection (brightness-based) -------------------
         if not blink_ok:
             blink_ok = blink_det.update_with_roi(roi_raw)
             if not blink_ok:
+                phase_msg = {
+                    "OPEN": "Blink once!",
+                    "DARK": "Open again...",
+                }.get(blink_det._phase, "Blink once!")
+                lcd.show("Anti-spoof", phase_msg)
                 phase_msg = {
                     "OPEN": "Blink once!",
                     "DARK": "Open again...",
