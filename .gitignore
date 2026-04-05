@@ -1,0 +1,21 @@
+# Sensitive Data & Media (What you requested)
+data/faces/
+data/qrcodes/
+
+# Security (Never upload secrets to GitHub)
+.env
+
+# Python Caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local Data, Logs, and Models
+data/logs/
+data/models/
+data/pending_sync/
+
+# OS/System/Editor specific temp files
+.lgd-nfy0
+.DS_Store
