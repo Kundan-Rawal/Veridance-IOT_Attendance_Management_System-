@@ -2,17 +2,15 @@
 """
 train.py  —  Enroll a student's face and retrain the LBPH model.
 
-Usage:
-    python train.py              # interactive mode (asks for details)
-    python train.py --list       # show all enrolled students
-    python train.py --remove ROLL_NO   # remove a student and retrain
+Controls during capture:
+    SPACE  -> capture this frame (only when green box is visible)
+    Q      -> quit early
 
-How it works:
-    1. Enter student name, roll number, department
-    2. Camera opens — student looks at camera
-    3. 30 face photos are captured automatically
-    4. Model is retrained on ALL enrolled students
-    5. LCD shows confirmation
+Usage:
+    python train.py              # enroll new student
+    python train.py --list       # list enrolled students
+    python train.py --remove ROLL_NO
+    python train.py --retrain    # retrain without enrolling
 """
 import sys
 import os
@@ -25,23 +23,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# ── Make sure we run from the project root ────────────────────────────────────
 os.chdir(Path(__file__).parent)
 
 from config import MODEL_PATH, LABELS_PATH, DATA_DIR
 from modules.lcd_controller import lcd
 
 FACES_DIR    = DATA_DIR / "faces"
-SAMPLE_COUNT = 30          # photos captured per student
-SAMPLE_DELAY = 0.15        # seconds between captures
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+SAMPLE_COUNT = 30
 
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
+
+# ── Label helpers ─────────────────────────────────────────────────────────────
 
 def list_enrolled():
     if not LABELS_PATH.exists():
@@ -52,11 +47,11 @@ def list_enrolled():
     if not rows:
         print("No students enrolled yet.")
         return
-    print(f"\n{'ID':<6} {'Roll No':<15} {'Name':<25} {'Dept'}")
-    print("─" * 60)
+    print(f"\n{'ID':<6} {'Roll No':<20} {'Name':<25} {'Dept'}")
+    print("-" * 65)
     for row in rows:
         if len(row) >= 4:
-            print(f"{row[0]:<6} {row[1]:<15} {row[2]:<25} {row[3]}")
+            print(f"{row[0]:<6} {row[1]:<20} {row[2]:<25} {row[3]}")
     print()
 
 
@@ -88,31 +83,23 @@ def remove_student(roll_no: str):
         return
     with open(LABELS_PATH, newline="") as f:
         rows = [r for r in csv.reader(f) if r]
-
     new_rows = [r for r in rows if r[1].upper() != roll_no.upper()]
     if len(new_rows) == len(rows):
         print(f"Roll number {roll_no} not found.")
         return
-
     with open(LABELS_PATH, "w", newline="") as f:
         csv.writer(f).writerows(new_rows)
-
     face_dir = FACES_DIR / roll_no.upper()
     if face_dir.exists():
         shutil.rmtree(face_dir)
         print(f"Deleted face photos for {roll_no}")
-
-    print(f"Removed {roll_no}. Retraining model…")
+    print(f"Removed {roll_no}. Retraining model...")
     train_model()
 
 
-# ── Capture ───────────────────────────────────────────────────────────────────
+# ── Live capture with preview window ─────────────────────────────────────────
 
 def capture_faces(roll_no: str, name: str) -> int:
-    """
-    Open camera, detect faces, save SAMPLE_COUNT grayscale face ROIs.
-    Returns number of samples actually saved.
-    """
     from picamera2 import Picamera2
 
     save_dir = FACES_DIR / roll_no.upper()
@@ -126,57 +113,93 @@ def capture_faces(roll_no: str, name: str) -> int:
     cam.start()
     time.sleep(1)
 
-    print(f"\n[CAPTURE] Camera ready.")
-    print(f"[CAPTURE] Look at the camera. Capturing {SAMPLE_COUNT} samples…")
-    print("[CAPTURE] Move your head slightly — small tilts help the model.")
+    saved = 0
+
+    print(f"\n[ENROLL] Camera open.")
+    print(f"[ENROLL] SPACE = capture frame (only when GREEN BOX is visible)")
+    print(f"[ENROLL] Q     = quit early")
+    print(f"[ENROLL] Tip: vary head angle slightly — look left, right, up, down\n")
     lcd.show("Enrolling", name[:16])
 
-    saved   = 0
-    attempt = 0
-
     while saved < SAMPLE_COUNT:
-        attempt += 1
         frame = cam.capture_array()
         bgr   = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
         gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        gray  = cv2.equalizeHist(gray)
+        gray_eq = cv2.equalizeHist(gray)
 
         faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+            gray_eq, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
         )
 
-        if len(faces) == 0:
-            if attempt % 20 == 0:
-                print(f"[CAPTURE] No face detected — please look at the camera.")
-                lcd.show("No face found", "Look at camera")
-            time.sleep(0.05)
-            continue
+        display      = bgr.copy()
+        face_found   = len(faces) > 0
+        best_face    = None
 
-        # Take the largest face
-        (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
-        roi = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+        if face_found:
+            best_face = max(faces, key=lambda f: f[2] * f[3])
+            x, y, w, h = best_face
+            cv2.rectangle(display, (x, y), (x+w, y+h), (0, 220, 0), 2)
+            cv2.putText(display, "Press SPACE to capture",
+                        (x, max(y - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
+        else:
+            cv2.putText(display, "No face — look at the camera",
+                        (30, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 220), 2)
 
-        path = save_dir / f"{saved:03d}.jpg"
-        cv2.imwrite(str(path), roi)
-        saved += 1
+        # ── Bottom progress bar ───────────────────────────────────────────
+        bar_fill = int((saved / SAMPLE_COUNT) * 640)
+        cv2.rectangle(display, (0, 458), (640, 480), (30, 30, 30), -1)
+        cv2.rectangle(display, (0, 458), (bar_fill, 480), (0, 190, 0), -1)
+        cv2.putText(display, f"Captured: {saved} / {SAMPLE_COUNT}",
+                    (10, 475), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
-        pct = int(saved / SAMPLE_COUNT * 100)
-        bar = "█" * (saved // 3) + "░" * ((SAMPLE_COUNT - saved) // 3)
-        print(f"\r[CAPTURE] {bar} {saved}/{SAMPLE_COUNT} ({pct}%)", end="", flush=True)
-        lcd.show(f"Capturing {pct}%", f"{saved}/{SAMPLE_COUNT}")
+        # ── Top status bar ────────────────────────────────────────────────
+        cv2.rectangle(display, (0, 0), (640, 30), (30, 30, 30), -1)
+        cv2.putText(display,
+                    f"Enrolling: {name}   |   Q = Quit",
+                    (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
-        time.sleep(SAMPLE_DELAY)
+        cv2.imshow("Enrollment - Face Capture", display)
+        key = cv2.waitKey(1) & 0xFF
 
-    print()   # newline after progress bar
+        # Q to quit
+        if key in (ord('q'), ord('Q')):
+            print(f"\n[ENROLL] Quit early. {saved} samples saved.")
+            break
+
+        # SPACE to capture
+        if key == ord(' '):
+            if face_found and best_face is not None:
+                x, y, w, h = best_face
+                roi = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+                path = save_dir / f"{saved:03d}.jpg"
+                cv2.imwrite(str(path), roi)
+                saved += 1
+
+                # Green flash confirmation
+                flash = display.copy()
+                cv2.rectangle(flash, (0, 0), (640, 480), (0, 255, 0), 8)
+                cv2.putText(flash, f"Saved {saved}/{SAMPLE_COUNT}",
+                            (190, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3)
+                cv2.imshow("Enrollment - Face Capture", flash)
+                cv2.waitKey(300)
+
+                lcd.show(f"Captured {saved}", f"of {SAMPLE_COUNT}")
+                print(f"[ENROLL] Saved {saved}/{SAMPLE_COUNT}")
+            else:
+                print("[ENROLL] No face in frame — position yourself and try again.")
+
     cam.stop()
-    print(f"[CAPTURE] Done. {saved} samples saved to {save_dir}")
+    cv2.destroyAllWindows()
+    print(f"[ENROLL] Done. {saved} samples saved to: {save_dir}")
     return saved
 
 
-# ── Train ─────────────────────────────────────────────────────────────────────
+# ── Train model ───────────────────────────────────────────────────────────────
 
 def train_model():
-    """Read ALL face photos from data/faces/, train LBPH, save model."""
     if not LABELS_PATH.exists():
         print("[TRAIN] No labels file. Enroll at least one student first.")
         return False
@@ -185,12 +208,10 @@ def train_model():
         label_rows = [r for r in csv.reader(f) if r]
 
     if not label_rows:
-        print("[TRAIN] Labels file is empty.")
+        print("[TRAIN] Labels file empty.")
         return False
 
-    # Build id → roll_no map
     id_map = {r[1].upper(): int(r[0]) for r in label_rows}
-
     faces, ids = [], []
 
     for roll_no, student_id in id_map.items():
@@ -198,30 +219,25 @@ def train_model():
         if not face_dir.exists():
             print(f"[TRAIN] WARNING: No photos for {roll_no} — skipping.")
             continue
-        imgs = list(face_dir.glob("*.jpg"))
-        if not imgs:
-            print(f"[TRAIN] WARNING: Empty photo dir for {roll_no} — skipping.")
-            continue
-        for img_path in imgs:
+        for img_path in sorted(face_dir.glob("*.jpg")):
             img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 faces.append(img)
                 ids.append(student_id)
 
     if not faces:
-        print("[TRAIN] No face images found. Cannot train.")
+        print("[TRAIN] No face images found.")
         return False
 
-    print(f"[TRAIN] Training on {len(faces)} images across {len(id_map)} student(s)…")
+    print(f"[TRAIN] Training on {len(faces)} images across {len(id_map)} student(s)...")
     lcd.show("Training...", "Please wait")
 
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.train(faces, np.array(ids))
-
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     recognizer.save(str(MODEL_PATH))
 
-    print(f"[TRAIN] Model saved → {MODEL_PATH}")
+    print(f"[TRAIN] Model saved -> {MODEL_PATH}")
     lcd.show("Model Ready!", f"{len(id_map)} student(s)")
     return True
 
@@ -229,9 +245,9 @@ def train_model():
 # ── Enroll flow ───────────────────────────────────────────────────────────────
 
 def enroll():
-    print("\n" + "═" * 50)
+    print("\n" + "=" * 50)
     print("  STUDENT ENROLLMENT")
-    print("═" * 50)
+    print("=" * 50)
 
     name = input("Full name      : ").strip()
     if not name:
@@ -244,13 +260,11 @@ def enroll():
         return
 
     if roll_exists(roll_no):
-        print(f"\nERROR: Roll number {roll_no} is already enrolled.")
-        print("Use --remove ROLL_NO first if you want to re-enroll.")
+        print(f"\nERROR: {roll_no} already enrolled.")
+        print("Use --remove ROLL_NO first to re-enroll.")
         return
 
-    dept = input("Department     : ").strip()
-    if not dept:
-        dept = "General"
+    dept = input("Department     : ").strip() or "General"
 
     print(f"\nEnrolling: {name} | {roll_no} | {dept}")
     confirm = input("Confirm? (y/n) : ").strip().lower()
@@ -261,33 +275,39 @@ def enroll():
     student_id = get_next_id()
     append_label(student_id, roll_no, name, dept)
 
-    print("\nGet ready — the camera will start in 3 seconds.")
+    print("\nCamera opens in 3 seconds...")
     for i in (3, 2, 1):
-        print(f"  {i}…")
+        print(f"  {i}...")
         time.sleep(1)
 
     saved = capture_faces(roll_no, name)
 
-    if saved < SAMPLE_COUNT:
-        print(f"[WARN] Only captured {saved}/{SAMPLE_COUNT} samples.")
+    if saved == 0:
+        print("No samples captured. Removing label entry.")
+        remove_student(roll_no)
+        return
 
-    print("\nRetraining model with all enrolled students…")
+    if saved < SAMPLE_COUNT:
+        print(f"[WARN] Only {saved}/{SAMPLE_COUNT} samples captured.")
+        print("       Consider re-enrolling for better accuracy.")
+
+    print("\nRetraining model with all enrolled students...")
     ok = train_model()
 
     if ok:
-        print(f"\n✅  {name} enrolled successfully (ID {student_id}).")
+        print(f"\n[OK] {name} enrolled successfully (ID {student_id}).")
         lcd.show("Enrolled!", name[:16])
     else:
-        print("\n❌  Training failed. Check errors above.")
+        print("\n[FAIL] Training failed. Check errors above.")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Attendance system enrollment tool")
-    parser.add_argument("--list",   action="store_true",  help="List enrolled students")
-    parser.add_argument("--remove", metavar="ROLL_NO",    help="Remove a student")
-    parser.add_argument("--retrain", action="store_true", help="Retrain model without enrolling")
+    parser = argparse.ArgumentParser(description="Attendance enrollment tool")
+    parser.add_argument("--list",    action="store_true", help="List enrolled students")
+    parser.add_argument("--remove",  metavar="ROLL_NO",   help="Remove a student")
+    parser.add_argument("--retrain", action="store_true", help="Retrain without enrolling")
     args = parser.parse_args()
 
     if args.list:

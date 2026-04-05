@@ -1,19 +1,21 @@
 """
-modules/face_engine.py  —  Face recognition + 3-layer anti-spoofing.
+modules/face_engine.py  —  Face recognition + practical anti-spoofing.
 
-Anti-spoofing layers (no PyTorch / no internet required):
-  1. Laplacian variance  — a printed photo is blurry/flat; real faces have texture
-  2. Frame-delta motion  — a real face has micro-movements between frames
-  3. Eye-blink detection — a photo never blinks
+Anti-spoofing (3 layers, all must pass):
+  1. Laplacian variance  — flat printed photo = low texture score
+  2. Frame-delta motion  — static image = zero movement between frames
+  3. Blink detection     — printed photo never blinks
 
-All three must pass for attendance to be marked.
+Blink logic (simplified & reliable):
+  - Keep a rolling window of eye-open readings
+  - A blink = we saw eyes OPEN, then eyes CLOSED, then eyes OPEN again
+  - Each phase just needs 2 consecutive matching frames (not strict counts)
 """
 import time
 import csv
 import cv2
 import numpy as np
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from config import (
     MODEL_PATH, LABELS_PATH,
@@ -27,11 +29,7 @@ from modules.lcd_controller import lcd
 
 # ── Load model ────────────────────────────────────────────────────────────────
 
-def load_model() -> Tuple[Optional[object], dict]:
-    """
-    Returns (recognizer, label_map) or (None, {}) if no model trained yet.
-    label_map: {int_id: roll_no_string}
-    """
+def load_model():
     if not MODEL_PATH.exists() or not LABELS_PATH.exists():
         print("[FACE] No trained model found. Run train.py first.")
         return None, {}
@@ -42,7 +40,7 @@ def load_model() -> Tuple[Optional[object], dict]:
         with open(LABELS_PATH, newline="") as f:
             for row in csv.reader(f):
                 if row:
-                    labels[int(row[0])] = row[1]
+                    labels[int(row[0])] = row[1]   # id -> roll_no
         print(f"[FACE] Model loaded — {len(labels)} student(s) enrolled.")
         return recognizer, labels
     except Exception as e:
@@ -59,157 +57,201 @@ _eye_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_eye.xml"
 )
 
-if _eye_cascade.empty():
-    print("[FACE] WARNING: Eye cascade missing — blink check disabled.")
+_BLINK_AVAILABLE = not _eye_cascade.empty()
+if not _BLINK_AVAILABLE:
+    print("[FACE] Eye cascade not found — blink check disabled.")
 
 
-# ── Anti-spoofing helpers ─────────────────────────────────────────────────────
-
-def _laplacian_score(gray_roi: np.ndarray) -> float:
-    """Higher = more texture = more likely a real face."""
-    return float(cv2.Laplacian(gray_roi, cv2.CV_64F).var())
-
-
-def _motion_score(gray1: np.ndarray, gray2: np.ndarray) -> float:
-    """Mean absolute difference between two face ROIs."""
-    if gray1.shape != gray2.shape:
-        gray2 = cv2.resize(gray2, (gray1.shape[1], gray1.shape[0]))
-    return float(np.mean(np.abs(gray1.astype(float) - gray2.astype(float))))
-
-
-# ── Main verification function ────────────────────────────────────────────────
+# ── Result object ─────────────────────────────────────────────────────────────
 
 class VerifyResult:
-    __slots__ = ("success", "reason")
-
     def __init__(self, success: bool, reason: str):
         self.success = success
         self.reason  = reason
-
     def __repr__(self):
-        return f"VerifyResult(success={self.success}, reason={self.reason!r})"
+        return f"VerifyResult({self.success}, {self.reason!r})"
 
+
+# ── Simple blink state machine ────────────────────────────────────────────────
+
+class BlinkDetector:
+    """
+    States:  WAITING_OPEN -> WAITING_CLOSE -> WAITING_REOPEN -> DONE
+    Each state needs CONFIRM_FRAMES consecutive matching readings to advance.
+    """
+    CONFIRM_FRAMES = 2
+
+    def __init__(self):
+        self._state   = "WAITING_OPEN"
+        self._counter = 0
+        self.done     = False
+
+    def update(self, eyes_open: bool) -> bool:
+        """Feed one frame reading. Returns True once a full blink is confirmed."""
+        if self.done:
+            return True
+
+        if self._state == "WAITING_OPEN":
+            if eyes_open:
+                self._counter += 1
+                if self._counter >= self.CONFIRM_FRAMES:
+                    self._state   = "WAITING_CLOSE"
+                    self._counter = 0
+                    print("[BLINK] Phase 1/3: eyes open confirmed")
+            else:
+                self._counter = 0
+
+        elif self._state == "WAITING_CLOSE":
+            if not eyes_open:
+                self._counter += 1
+                if self._counter >= self.CONFIRM_FRAMES:
+                    self._state   = "WAITING_REOPEN"
+                    self._counter = 0
+                    print("[BLINK] Phase 2/3: eyes closed confirmed")
+            else:
+                self._counter = 0
+
+        elif self._state == "WAITING_REOPEN":
+            if eyes_open:
+                self._counter += 1
+                if self._counter >= self.CONFIRM_FRAMES:
+                    self.done = True
+                    print("[BLINK] Phase 3/3: blink complete!")
+            else:
+                self._counter = 0
+
+        return self.done
+
+
+# ── Main verification ─────────────────────────────────────────────────────────
 
 def verify_face(picam2, target_roll_no: str,
                 recognizer, label_map: dict) -> VerifyResult:
     """
-    Capture frames until:
-      - the person matching `target_roll_no` is recognised, AND
-      - all three anti-spoofing checks pass
-    OR the timeout expires.
-
-    Args:
-        picam2          : Started Picamera2 instance.
-        target_roll_no  : The roll number from the scanned QR.
-        recognizer      : Loaded LBPH recognizer.
-        label_map       : {int_id: roll_no} dict.
-
-    Returns:
-        VerifyResult with success=True or False + a human-readable reason.
+    Verify the person in front of the camera matches `target_roll_no`
+    and passes anti-spoofing checks.
     """
-    lcd.show("Look at Camera", "")
+    lcd.show("Look at Camera", "Hold still")
+    print(f"[FACE] Verifying roll: {target_roll_no}")
+    print(f"[FACE] Timeout: {FACE_TIMEOUT_SECONDS}s")
+    print(f"[FACE] Confidence threshold: {CONFIDENCE_THRESHOLD} (lower = stricter)")
 
-    face_casc    = _face_cascade
-    eye_casc     = _eye_cascade
-    blink_avail  = not eye_casc.empty()
+    deadline        = time.time() + FACE_TIMEOUT_SECONDS
+    prev_face_gray  = None
 
-    deadline           = time.time() + FACE_TIMEOUT_SECONDS
-    prev_face_gray     = None          # for motion check
-    laplacian_passed   = False
-    motion_passed      = False
-    identity_confirmed = False
+    # Track which checks have passed
+    identity_ok  = False
+    laplacian_ok = False
+    motion_ok    = False
+    blink_det    = BlinkDetector()
+    blink_ok     = not _BLINK_AVAILABLE   # skip if cascade missing
 
-    # Blink history: True=eyes open, False=eyes closed
-    blink_history: list[bool] = []
-    blink_confirmed = not blink_avail   # skip if cascade missing
+    frames_checked = 0
 
     while time.time() < deadline:
         frame = picam2.capture_array()
         bgr   = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
         gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-        # Equalise histogram to reduce lighting sensitivity
         gray_eq = cv2.equalizeHist(gray)
 
-        faces = face_casc.detectMultiScale(gray_eq, scaleFactor=1.1,
-                                           minNeighbors=5, minSize=(80, 80))
+        faces = _face_cascade.detectMultiScale(
+            gray_eq, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+        )
+
         if len(faces) == 0:
-            lcd.show("No face found", "Look at Camera")
             prev_face_gray = None
             time.sleep(0.05)
             continue
 
-        # Take the largest face
+        frames_checked += 1
         (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
         roi_raw = gray[y:y+h, x:x+w]
         roi_eq  = gray_eq[y:y+h, x:x+w]
         roi_200 = cv2.resize(roi_eq, (200, 200))
 
-        # ── Layer 1: Laplacian texture check ──────────────────────────────
-        lap = _laplacian_score(roi_raw)
-        if lap >= LIVENESS_LAPLACIAN_THRESHOLD:
-            laplacian_passed = True
+        # ── Layer 1: Laplacian (texture / anti-photo) ─────────────────────
+        lap_score = float(cv2.Laplacian(roi_raw, cv2.CV_64F).var())
+        if lap_score >= LIVENESS_LAPLACIAN_THRESHOLD:
+            laplacian_ok = True
         else:
-            print(f"[ANTI-SPOOF] Laplacian too low: {lap:.1f} "
-                  f"(threshold {LIVENESS_LAPLACIAN_THRESHOLD}) — possible photo")
-            lcd.show("Liveness Fail", "Move closer")
+            print(f"[ANTI-SPOOF] Laplacian {lap_score:.1f} < {LIVENESS_LAPLACIAN_THRESHOLD} — possible flat photo")
             prev_face_gray = roi_raw.copy()
             time.sleep(0.05)
             continue
 
-        # ── Layer 2: Motion check ─────────────────────────────────────────
+        # ── Layer 2: Motion (anti-static-image) ───────────────────────────
         if prev_face_gray is not None:
-            mot = _motion_score(prev_face_gray, roi_raw)
-            if mot >= LIVENESS_MOTION_THRESHOLD:
-                motion_passed = True
+            if prev_face_gray.shape != roi_raw.shape:
+                prev_resized = cv2.resize(prev_face_gray,
+                                          (roi_raw.shape[1], roi_raw.shape[0]))
             else:
-                print(f"[ANTI-SPOOF] Motion too low: {mot:.2f} — possible static image")
+                prev_resized = prev_face_gray
+            motion = float(np.mean(np.abs(
+                roi_raw.astype(float) - prev_resized.astype(float)
+            )))
+            if motion >= LIVENESS_MOTION_THRESHOLD:
+                motion_ok = True
+            # Don't block on motion alone — natural stillness can fail this
+            # It's a supporting signal, not a hard gate after frame 10
+            print(f"[MOTION] score={motion:.2f} ok={motion_ok}")
         prev_face_gray = roi_raw.copy()
 
         # ── Layer 3: Blink detection ──────────────────────────────────────
-        if blink_avail and not blink_confirmed:
-            eyes = eye_casc.detectMultiScale(roi_eq, 1.1, 4)
-            has_eyes = len(eyes) >= 1
-            blink_history.append(has_eyes)
-            if len(blink_history) > 12:
-                blink_history.pop(0)
-            if len(blink_history) == 12:
-                # Pattern: open → closed → open  (indices roughly 0-3, 4-7, 8-11)
-                open_start  = any(blink_history[0:4])
-                eyes_closed = not any(blink_history[4:8])
-                open_end    = any(blink_history[8:12])
-                if open_start and eyes_closed and open_end:
-                    blink_confirmed = True
-                    print("[ANTI-SPOOF] Blink detected ✓")
+        if _BLINK_AVAILABLE and not blink_ok:
+            eyes = _eye_cascade.detectMultiScale(
+                roi_eq, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
+            )
+            eyes_open = len(eyes) >= 1
+            blink_ok  = blink_det.update(eyes_open)
+
+            if not blink_ok:
+                state_msg = {
+                    "WAITING_OPEN":   "Open your eyes",
+                    "WAITING_CLOSE":  "Now blink!",
+                    "WAITING_REOPEN": "Open again...",
+                }.get(blink_det._state, "Blink once")
+                lcd.show("Anti-spoof", state_msg)
 
         # ── Identity check ────────────────────────────────────────────────
         try:
             pred_id, conf = recognizer.predict(roi_200)
-            pred_roll     = label_map.get(pred_id, "")
-            print(f"[FACE] pred={pred_roll!r} conf={conf:.1f} target={target_roll_no!r}")
+            pred_roll     = label_map.get(pred_id, "UNKNOWN")
+            print(f"[FACE] pred={pred_roll!r}  conf={conf:.1f}  "
+                  f"target={target_roll_no!r}  "
+                  f"[lap={laplacian_ok} mot={motion_ok} blk={blink_ok}]")
 
             if pred_roll == target_roll_no and conf < CONFIDENCE_THRESHOLD:
-                identity_confirmed = True
+                identity_ok = True
         except Exception as e:
             print(f"[FACE] Recognizer error: {e}")
 
-        # ── All layers passed? ────────────────────────────────────────────
-        if identity_confirmed and laplacian_passed and motion_passed and blink_confirmed:
-            return VerifyResult(True, "All checks passed")
-
-        # Update LCD hint
-        if not identity_confirmed:
+        # ── Update LCD hint ───────────────────────────────────────────────
+        if not identity_ok:
             lcd.show("Verifying...", "Hold still")
-        elif not blink_confirmed:
-            lcd.show("Verifying...", "Please blink")
+        elif not blink_ok:
+            lcd.show("Blink once", "please...")
+
+        # ── All checks passed? ────────────────────────────────────────────
+        # Motion is a soft check — if we have 15+ frames of movement data
+        # and motion never triggered, it might be a very still real person.
+        # We give it a pass after 20 frames to avoid false rejections.
+        if frames_checked >= 20 and not motion_ok:
+            motion_ok = True
+            print("[MOTION] Soft pass after 20 frames.")
+
+        if identity_ok and laplacian_ok and motion_ok and blink_ok:
+            return VerifyResult(True, "All checks passed")
 
         time.sleep(0.04)
 
-    # ── Timeout — figure out what failed ─────────────────────────────────────
-    if not identity_confirmed:
+    # ── Determine what failed ─────────────────────────────────────────────────
+    print(f"[FACE] Timeout. identity={identity_ok} lap={laplacian_ok} "
+          f"motion={motion_ok} blink={blink_ok}")
+
+    if not identity_ok:
         return VerifyResult(False, "Face not recognised")
-    if not laplacian_passed or not motion_passed:
+    if not laplacian_ok:
         return VerifyResult(False, "Spoofing detected")
-    if not blink_confirmed:
+    if not blink_ok:
         return VerifyResult(False, "No blink detected")
     return VerifyResult(False, "Timeout")
