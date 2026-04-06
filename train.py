@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-train.py  —  Enroll a student's face and retrain the LBPH model.
-
-Controls during capture:
-    SPACE  -> capture this frame (only when green box is visible)
-    Q      -> quit early
+train.py  —  Enroll a student's face, sync with cloud DB, and retrain the LBPH model.
 
 Usage:
-    python train.py              # enroll new student
-    python train.py --list       # list enrolled students
+    python train.py              # enroll new student to cloud + local
+    python train.py --list       # list locally enrolled students
     python train.py --remove ROLL_NO
     python train.py --retrain    # retrain without enrolling
 """
@@ -18,6 +14,8 @@ import csv
 import time
 import argparse
 import shutil
+import getpass
+import requests
 from pathlib import Path
 
 import cv2
@@ -25,13 +23,12 @@ import numpy as np
 
 os.chdir(Path(__file__).parent)
 
-from config import MODEL_PATH, LABELS_PATH, DATA_DIR, HAAR_FACE
+from config import MODEL_PATH, LABELS_PATH, DATA_DIR, HAAR_FACE, CLOUD_API_BASE_URL
 from modules.lcd_controller import lcd
 
 FACES_DIR    = DATA_DIR / "faces"
 SAMPLE_COUNT = 30
 
-from config import MODEL_PATH, LABELS_PATH, DATA_DIR, HAAR_FACE
 face_cascade = cv2.CascadeClassifier(HAAR_FACE)
 
 
@@ -66,8 +63,7 @@ def roll_exists(roll_no: str) -> bool:
     if not LABELS_PATH.exists():
         return False
     with open(LABELS_PATH, newline="") as f:
-        return any(r[1].upper() == roll_no.upper()
-                   for r in csv.reader(f) if r)
+        return any(r[1].upper() == roll_no.upper() for r in csv.reader(f) if r)
 
 
 def append_label(student_id: int, roll_no: str, name: str, dept: str):
@@ -146,14 +142,12 @@ def capture_faces(roll_no: str, name: str) -> int:
                         (30, 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 220), 2)
 
-        # ── Bottom progress bar ───────────────────────────────────────────
         bar_fill = int((saved / SAMPLE_COUNT) * 640)
         cv2.rectangle(display, (0, 458), (640, 480), (30, 30, 30), -1)
         cv2.rectangle(display, (0, 458), (bar_fill, 480), (0, 190, 0), -1)
         cv2.putText(display, f"Captured: {saved} / {SAMPLE_COUNT}",
                     (10, 475), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
-        # ── Top status bar ────────────────────────────────────────────────
         cv2.rectangle(display, (0, 0), (640, 30), (30, 30, 30), -1)
         cv2.putText(display,
                     f"Enrolling: {name}   |   Q = Quit",
@@ -162,12 +156,10 @@ def capture_faces(roll_no: str, name: str) -> int:
         cv2.imshow("Enrollment - Face Capture", display)
         key = cv2.waitKey(1) & 0xFF
 
-        # Q to quit
         if key in (ord('q'), ord('Q')):
             print(f"\n[ENROLL] Quit early. {saved} samples saved.")
             break
 
-        # SPACE to capture
         if key == ord(' '):
             if face_found and best_face is not None:
                 x, y, w, h = best_face
@@ -176,7 +168,6 @@ def capture_faces(roll_no: str, name: str) -> int:
                 cv2.imwrite(str(path), roi)
                 saved += 1
 
-                # Green flash confirmation
                 flash = display.copy()
                 cv2.rectangle(flash, (0, 0), (640, 480), (0, 255, 0), 8)
                 cv2.putText(flash, f"Saved {saved}/{SAMPLE_COUNT}",
@@ -244,60 +235,137 @@ def train_model():
 # ── Enroll flow ───────────────────────────────────────────────────────────────
 
 def enroll():
-    print("\n" + "=" * 50)
-    print("  STUDENT ENROLLMENT")
-    print("=" * 50)
+    print("\n" + "=" * 55)
+    print("  STUDENT ENROLLMENT (CLOUD + LOCAL DB)")
+    print("=" * 55)
 
+    if not CLOUD_API_BASE_URL:
+        print("\n[ERROR] CLOUD_API_BASE_URL is not set in config.py")
+        print("You must set your Render backend URL before enrolling.")
+        return
+
+    # --- Phase 1: Cloud Authentication ---
+    print("\n[1] Authenticate with Cloud Database")
+    admin_email = input("Admin Email    : ").strip()
+    admin_pass  = getpass.getpass("Admin Password : ").strip()
+
+    try:
+        resp = requests.post(
+            f"{CLOUD_API_BASE_URL}/api/auth/login",
+            data={"username": admin_email, "password": admin_pass},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            print(f"\n[ERROR] Authentication failed. Check credentials.")
+            return
+        
+        token = resp.json().get("access_token")
+        headers = {"Authorization": f"Bearer {token}"}
+        print("[OK] Authorized as Admin.")
+    except Exception as e:
+        print(f"\n[ERROR] Could not connect to the cloud: {e}")
+        return
+
+    # --- Phase 2: Fetch Departments ---
+    try:
+        resp = requests.get(f"{CLOUD_API_BASE_URL}/api/departments", headers=headers, timeout=10)
+        depts = resp.json()
+        if not depts:
+            print("\n[ERROR] No departments found in the cloud.")
+            print("Please create a department in the backend API before enrolling students.")
+            return
+    except Exception as e:
+        print(f"\n[ERROR] Could not fetch departments: {e}")
+        return
+
+    # --- Phase 3: Gather Data ---
+    print("\n[2] Student Details")
     name = input("Full name      : ").strip()
     if not name:
-        print("Name cannot be empty.")
-        return
+        return print("Name cannot be empty.")
 
     roll_no = input("Roll number    : ").strip().upper()
     if not roll_no:
-        print("Roll number cannot be empty.")
-        return
+        return print("Roll number cannot be empty.")
 
     if roll_exists(roll_no):
-        print(f"\nERROR: {roll_no} already enrolled.")
+        print(f"\n[ERROR] {roll_no} is already enrolled locally on this Pi.")
         print("Use --remove ROLL_NO first to re-enroll.")
         return
 
-    dept = input("Department     : ").strip() or "General"
+    print("\nAvailable Cloud Departments:")
+    for d in depts:
+        print(f"  [{d['id']}] {d['name']} ({d['code']})")
 
-    print(f"\nEnrolling: {name} | {roll_no} | {dept}")
-    confirm = input("Confirm? (y/n) : ").strip().lower()
-    if confirm != "y":
-        print("Cancelled.")
-        return
+    try:
+        dept_id = int(input("Department ID  : ").strip())
+    except ValueError:
+        return print("Invalid ID.")
 
-    student_id = get_next_id()
-    append_label(student_id, roll_no, name, dept)
+    valid_dept = next((d for d in depts if d['id'] == dept_id), None)
+    if not valid_dept:
+        return print("Invalid Department ID selected.")
 
-    print("\nCamera opens in 3 seconds...")
+    student_pass = getpass.getpass("Student Pass   : ").strip()
+    if len(student_pass) < 4:
+        return print("Password too short.")
+
+    # --- Phase 4: Local Capture ---
+    print("\n[3] Local Face Capture")
+    print("Camera opens in 3 seconds...")
     for i in (3, 2, 1):
         print(f"  {i}...")
         time.sleep(1)
 
     saved = capture_faces(roll_no, name)
 
-    if saved == 0:
-        print("No samples captured. Removing label entry.")
-        remove_student(roll_no)
+    if saved < SAMPLE_COUNT:
+        print(f"\n[WARN] Capture incomplete ({saved}/{SAMPLE_COUNT}). Aborting enrollment.")
+        # Rollback captured photos to prevent orphaned files
+        face_dir = FACES_DIR / roll_no.upper()
+        if face_dir.exists():
+            shutil.rmtree(face_dir)
         return
 
-    if saved < SAMPLE_COUNT:
-        print(f"[WARN] Only {saved}/{SAMPLE_COUNT} samples captured.")
-        print("       Consider re-enrolling for better accuracy.")
+    # --- Phase 5: Push to Cloud ---
+    print(f"\n[4] Pushing {name} ({roll_no}) to Neon Database...")
+    payload = {
+        "roll_no": roll_no,
+        "name": name,
+        "email": f"{roll_no.lower()}@student.college.edu",
+        "dept_id": dept_id,
+        "password": student_pass
+    }
 
-    print("\nRetraining model with all enrolled students...")
+    try:
+        resp = requests.post(f"{CLOUD_API_BASE_URL}/api/students", json=payload, headers=headers, timeout=10)
+        if resp.status_code == 400 and "already exists" in resp.text:
+            print("[WARN] Student already exists in the cloud DB. Continuing to sync local model.")
+        elif resp.status_code != 200:
+            print(f"\n[ERROR] Failed to create student in cloud: {resp.text}")
+            print("Rolling back local capture...")
+            shutil.rmtree(FACES_DIR / roll_no.upper(), ignore_errors=True)
+            return
+        else:
+            print("[OK] Student successfully created in Neon Database.")
+    except Exception as e:
+        print(f"\n[ERROR] Network error while registering student: {e}")
+        print("Rolling back local capture...")
+        shutil.rmtree(FACES_DIR / roll_no.upper(), ignore_errors=True)
+        return
+
+    # --- Phase 6: Finalize Local DB & Retrain ---
+    print("\n[5] Finalizing local database and retraining model...")
+    student_id = get_next_id()
+    append_label(student_id, roll_no, name, valid_dept['name'])
+
     ok = train_model()
 
     if ok:
-        print(f"\n[OK] {name} enrolled successfully (ID {student_id}).")
+        print(f"\n[OK] {name} enrolled successfully to both Cloud and Local Pi.")
         lcd.show("Enrolled!", name[:16])
     else:
-        print("\n[FAIL] Training failed. Check errors above.")
+        print("\n[FAIL] Local training failed. Check errors above.")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
