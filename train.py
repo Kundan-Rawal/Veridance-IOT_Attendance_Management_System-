@@ -253,7 +253,7 @@ def enroll():
         resp = requests.post(
             f"{CLOUD_API_BASE_URL}/api/auth/login",
             data={"username": admin_email, "password": admin_pass},
-            timeout=10
+            timeout=60
         )
         if resp.status_code != 200:
             print(f"\n[ERROR] Authentication failed. Check credentials.")
@@ -268,9 +268,13 @@ def enroll():
 
     # --- Phase 2: Fetch Departments ---
     try:
-        resp = requests.get(f"{CLOUD_API_BASE_URL}/api/departments", headers=headers, timeout=10)
+        resp = requests.get(f"{CLOUD_API_BASE_URL}/api/departments", headers=headers, timeout=60)
+        if resp.status_code != 200:
+            print(f"\n[ERROR] Failed to fetch departments. API responded with: {resp.text}")
+            return
+            
         depts = resp.json()
-        if not depts:
+        if not isinstance(depts, list) or not depts:
             print("\n[ERROR] No departments found in the cloud.")
             print("Please create a department in the backend API before enrolling students.")
             return
@@ -338,7 +342,7 @@ def enroll():
     }
 
     try:
-        resp = requests.post(f"{CLOUD_API_BASE_URL}/api/students", json=payload, headers=headers, timeout=10)
+        resp = requests.post(f"{CLOUD_API_BASE_URL}/api/students", json=payload, headers=headers, timeout=60)
         if resp.status_code == 400 and "already exists" in resp.text:
             print("[WARN] Student already exists in the cloud DB. Continuing to sync local model.")
         elif resp.status_code != 200:
