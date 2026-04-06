@@ -46,7 +46,7 @@ def decode_token(token: str) -> Optional[dict]:
         return None
 
 
-# ── Dependency: current admin ─────────────────────────────────────────────────
+# ── Dependency: current admin ───────────────────────────────────────────────
 
 def get_current_admin(
     token: str = Depends(oauth2_scheme),
@@ -60,8 +60,15 @@ def get_current_admin(
     payload = decode_token(token)
     if not payload or payload.get("role") != "admin":
         raise credentials_exception
+        
+    # FACT: Convert the strict JWT string 'sub' back to an integer for Postgres
+    try:
+        admin_id = int(payload.get("sub"))
+    except (ValueError, TypeError):
+        raise credentials_exception
+
     admin = db.query(models.Admin).filter(
-        models.Admin.id == payload.get("sub")
+        models.Admin.id == admin_id
     ).first()
     if not admin or not admin.is_active:
         raise credentials_exception
@@ -81,8 +88,15 @@ def get_current_student(
     payload = decode_token(token)
     if not payload or payload.get("role") != "student":
         raise credentials_exception
+
+    # FACT: Convert the strict JWT string 'sub' back to an integer for Postgres
+    try:
+        student_id = int(payload.get("sub"))
+    except (ValueError, TypeError):
+        raise credentials_exception
+
     student = db.query(models.Student).filter(
-        models.Student.id == payload.get("sub")
+        models.Student.id == student_id
     ).first()
     if not student or not student.is_active:
         raise credentials_exception
