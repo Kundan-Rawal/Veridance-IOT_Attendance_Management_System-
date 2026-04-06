@@ -25,7 +25,7 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     # Try admin first
     admin = db.query(models.Admin).filter(models.Admin.email == form.username).first()
     if admin and verify_password(form.password, admin.password_hash):
-        token = create_token({"sub": admin.id, "role": "admin"})
+        token = create_token({"sub": str(student.id), "role": "student"})
         return TokenResponse(access_token=token, role="admin", name=admin.name)
 
     # Try student
