@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
 train.py  —  Enroll a student's face, sync with cloud DB, and retrain the LBPH model.
-
-Usage:
-    python train.py              # enroll new student to cloud + local
-    python train.py --list       # list locally enrolled students
-    python train.py --remove ROLL_NO
-    python train.py --retrain    # retrain without enrolling
+Generates JSON-based QR codes and dynamic emails.
 """
 import sys
 import os
@@ -17,6 +12,7 @@ import shutil
 import getpass
 import requests
 import qrcode
+import json
 from pathlib import Path
 
 import cv2
@@ -243,7 +239,6 @@ def enroll():
 
     if not CLOUD_API_BASE_URL:
         print("\n[ERROR] CLOUD_API_BASE_URL is not set in config.py")
-        print("You must set your Render backend URL before enrolling.")
         return
 
     # --- Phase 1: Cloud Authentication ---
@@ -278,7 +273,6 @@ def enroll():
         depts = resp.json()
         if not isinstance(depts, list) or not depts:
             print("\n[ERROR] No departments found in the cloud.")
-            print("Please create a department in the backend API before enrolling students.")
             return
     except Exception as e:
         print(f"\n[ERROR] Could not fetch departments: {e}")
@@ -295,8 +289,7 @@ def enroll():
         return print("Roll number cannot be empty.")
 
     if roll_exists(roll_no):
-        print(f"\n[ERROR] {roll_no} is already enrolled locally on this Pi.")
-        print("Use --remove ROLL_NO first to re-enroll.")
+        print(f"\n[ERROR] {roll_no} already enrolled locally.")
         return
 
     print("\nAvailable Cloud Departments:")
@@ -326,8 +319,7 @@ def enroll():
     saved = capture_faces(roll_no, name)
 
     if saved < SAMPLE_COUNT:
-        print(f"\n[WARN] Capture incomplete ({saved}/{SAMPLE_COUNT}). Aborting enrollment.")
-        # Rollback captured photos to prevent orphaned files
+        print(f"\n[WARN] Capture incomplete. Aborting.")
         face_dir = FACES_DIR / roll_no.upper()
         if face_dir.exists():
             shutil.rmtree(face_dir)
@@ -336,9 +328,9 @@ def enroll():
     # --- Phase 5: Push to Cloud ---
     print(f"\n[4] Pushing {name} ({roll_no}) to Neon Database...")
     
-    # Generate dynamic email exactly as requested
+    # FACT: Name (no spaces) + Dept Code + Roll suffix (last 2)
     name_clean = name.replace(" ", "").lower()
-    dept_code = valid_dept['code']
+    dept_code = valid_dept['code'].lower()
     roll_suffix = roll_no[-2:] if len(roll_no) >= 2 else roll_no
     dynamic_email = f"{name_clean}{dept_code}{roll_suffix}@SOIT.com"
 
@@ -353,17 +345,15 @@ def enroll():
     try:
         resp = requests.post(f"{CLOUD_API_BASE_URL}/api/students", json=payload, headers=headers, timeout=60)
         if resp.status_code == 400 and "already exists" in resp.text:
-            print("[WARN] Student already exists in the cloud DB. Continuing to sync local model.")
+            print("[WARN] Student already exists in cloud DB. Syncing local model.")
         elif resp.status_code != 200:
             print(f"\n[ERROR] Failed to create student in cloud: {resp.text}")
-            print("Rolling back local capture...")
             shutil.rmtree(FACES_DIR / roll_no.upper(), ignore_errors=True)
             return
         else:
-            print("[OK] Student successfully created in Neon Database.")
+            print(f"[OK] Student registered as {dynamic_email}")
     except Exception as e:
-        print(f"\n[ERROR] Network error while registering student: {e}")
-        print("Rolling back local capture...")
+        print(f"\n[ERROR] Network error: {e}")
         shutil.rmtree(FACES_DIR / roll_no.upper(), ignore_errors=True)
         return
 
@@ -372,33 +362,39 @@ def enroll():
     student_id = get_next_id()
     append_label(student_id, roll_no, name, valid_dept['name'])
 
-    # --- Phase 7: Generate QR Code ---
-    print(f"\n[6] Generating QR Code for {roll_no}...")
+    # --- Phase 7: Generate QR Code (JSON) ---
+    print(f"\n[6] Generating JSON QR Code for {roll_no}...")
     QR_DIR.mkdir(parents=True, exist_ok=True)
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=10, border=4)
-    qr.add_data(roll_no)
+    
+    # FACT: QR now contains name, roll, and dept for kiosk display
+    qr_payload = json.dumps({
+        "name": name,
+        "roll_no": roll_no,
+        "dept": valid_dept['name']
+    })
+    
+    qr.add_data(qr_payload)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     qr_path = QR_DIR / f"{roll_no}.png"
     img.save(str(qr_path))
-    print(f"[OK] QR Code saved to: {qr_path}")
+    print(f"[OK] JSON QR Code saved: {qr_path}")
 
     ok = train_model()
 
     if ok:
-        print(f"\n[OK] {name} enrolled successfully to both Cloud and Local Pi.")
+        print(f"\n[OK] {name} enrollment complete.")
         lcd.show("Enrolled!", name[:16])
     else:
-        print("\n[FAIL] Local training failed. Check errors above.")
+        print("\n[FAIL] Local training failed.")
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Attendance enrollment tool")
-    parser.add_argument("--list",    action="store_true", help="List enrolled students")
-    parser.add_argument("--remove",  metavar="ROLL_NO",   help="Remove a student")
-    parser.add_argument("--retrain", action="store_true", help="Retrain without enrolling")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--list",    action="store_true")
+    parser.add_argument("--remove",  metavar="ROLL_NO")
+    parser.add_argument("--retrain", action="store_true")
     args = parser.parse_args()
 
     if args.list:
