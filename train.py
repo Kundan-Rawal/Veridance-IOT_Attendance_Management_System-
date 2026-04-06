@@ -16,6 +16,7 @@ import argparse
 import shutil
 import getpass
 import requests
+import qrcode
 from pathlib import Path
 
 import cv2
@@ -27,6 +28,7 @@ from config import MODEL_PATH, LABELS_PATH, DATA_DIR, HAAR_FACE, CLOUD_API_BASE_
 from modules.lcd_controller import lcd
 
 FACES_DIR    = DATA_DIR / "faces"
+QR_DIR       = DATA_DIR / "qrcodes"
 SAMPLE_COUNT = 30
 
 face_cascade = cv2.CascadeClassifier(HAAR_FACE)
@@ -333,10 +335,17 @@ def enroll():
 
     # --- Phase 5: Push to Cloud ---
     print(f"\n[4] Pushing {name} ({roll_no}) to Neon Database...")
+    
+    # Generate dynamic email exactly as requested
+    name_clean = name.replace(" ", "").lower()
+    dept_code = valid_dept['code']
+    roll_suffix = roll_no[-2:] if len(roll_no) >= 2 else roll_no
+    dynamic_email = f"{name_clean}{dept_code}{roll_suffix}@SOIT.com"
+
     payload = {
         "roll_no": roll_no,
         "name": name,
-        "email": f"{roll_no.lower()}@student.college.edu",
+        "email": dynamic_email,
         "dept_id": dept_id,
         "password": student_pass
     }
@@ -362,6 +371,17 @@ def enroll():
     print("\n[5] Finalizing local database and retraining model...")
     student_id = get_next_id()
     append_label(student_id, roll_no, name, valid_dept['name'])
+
+    # --- Phase 7: Generate QR Code ---
+    print(f"\n[6] Generating QR Code for {roll_no}...")
+    QR_DIR.mkdir(parents=True, exist_ok=True)
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=10, border=4)
+    qr.add_data(roll_no)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    qr_path = QR_DIR / f"{roll_no}.png"
+    img.save(str(qr_path))
+    print(f"[OK] QR Code saved to: {qr_path}")
 
     ok = train_model()
 
