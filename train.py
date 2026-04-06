@@ -25,7 +25,7 @@ from modules.lcd_controller import lcd
 
 FACES_DIR    = DATA_DIR / "faces"
 QR_DIR       = DATA_DIR / "qrcodes"
-SAMPLE_COUNT = 30
+SAMPLE_COUNT = 100
 
 face_cascade = cv2.CascadeClassifier(HAAR_FACE)
 
