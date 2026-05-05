@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/* v4 way of defining custom colors */
+@theme {
+  --color-candy-pink: #ff7eb3;
+  --color-candy-purple: #7b4397;
+  --color-candy-blue: #4facfe;
+  --color-candy-cyan: #00f2fe;
+}
+
+body {
+  /* Vibrant animated gradient background using our custom colors */
+  background: linear-gradient(-45deg, var(--color-candy-pink), var(--color-candy-purple), var(--color-candy-blue), var(--color-candy-cyan));
+  background-size: 400% 400%;
+  animation: gradientBG 15s ease infinite;
+  min-height: 100vh;
+  color: #333;
+}
+
+
+
+@keyframes gradientBG {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* v4 way of creating a custom utility class */
+@utility glass-panel {
+  background-color: rgb(255 255 255 / 0.3);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgb(255 255 255 / 0.4);
+  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+  border-radius: 1rem;
+}
